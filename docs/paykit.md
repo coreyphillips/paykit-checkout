@@ -49,6 +49,14 @@ paykit-checkout --network regtest worker --min-confirmations 2
 
 The invoice command prints its guest checkout path. The worker prepares and activates the private request and polls its status. Use one to six confirmations for this rail. Run `paykit-checkout status <invoice-id>` to inspect delivery and settlement separately. A delivered request tells you the proposal reached the upstream transport. Fulfillment uses the shared ledger's settlement event.
 
+## Pay in Bitkit
+
+On the buyer's device, create a Pubky profile from **Profile**. Enable **Private contact payments** in **Settings > General**. In **Contacts > Add Contact**, enter the merchant's full Pubky ID and save it. On the merchant checkout, enter the buyer's Pubky ID and select **Request in wallet**.
+
+Open Bitkit and review the incoming request. Check the merchant contact and amount, then open **Show Details** to see the network fee. Swipe once to approve. Bitkit shows **Bitcoin Sent** after broadcast. The store fulfills the order once its worker observes the required confirmations.
+
+This flow was verified with a fresh iPhone simulator using the [Bitkit iOS source at 2f697c1](https://github.com/synonymdev/bitkit-ios/commit/2f697c14a354cdab874e5172439822ee8d792eca). The debug build used an isolated regtest Electrum endpoint. A 50,000-sat private request reached six confirmations and produced one store settlement event.
+
 ## Retries, expiry and recovery
 
 SQLite binds the invoice to its Reader, merchant identity, provider origin and a random request reference. Creation retries preserve the reference and terms. An exact replay recovers the original upstream invoice when a response was lost. A second Reader on the same order conflicts. If the provider explicitly reports that an unactivated preparation expired, the worker can prepare a new reference within the original local window.
