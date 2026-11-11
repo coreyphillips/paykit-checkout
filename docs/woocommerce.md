@@ -36,3 +36,22 @@ WooCommerce sends the exact BTC order total in satoshis. Each shop has a persist
 A settled webhook triggers an authenticated status lookup. The gateway checks the invoice reference, shop order, amount and network, then calls WooCommerce's payment completion routine for an eligible unpaid order. It serializes simultaneous deliveries for the same order. Recovery after a chain reorganization or delivery retry checks current settlement and the existing paid marker before completing an order.
 
 Partial, late, excess and multiple payments need merchant review. A change in settlement after payment adds an order note. Review fulfilment and any refund in WooCommerce before taking further action. The gateway does not send payments or issue automatic refunds.
+
+## Repeat the regtest checkout checks
+
+Use a disposable WordPress shop, its own merchant database, and a funded Bitcoin Core regtest wallet. Point the worker at an Electrs instance indexing that same node. These steps change the test chain. Run the worker with `--once` to control when it observes payments and delivers events.
+
+1. In WooCommerce create a virtual product priced at `0.00000501` BTC. Place one order through the checkout block and another through a page containing `[woocommerce_checkout]`. Both public checkout pages must show **501 sats**. Check that both WooCommerce orders show a total of `0.00000501` BTC. Each order must have its own receiving address.
+2. Send `0.00000501` BTC to each invoice address. Mine two blocks, wait for Electrs to index them, then run the worker with webhook delivery enabled. Verify that WooCommerce assigns the checkout invoice ID as its transaction ID and marks both orders paid.
+3. For a third order, pay its invoice and mine two blocks on an otherwise idle chain. Record the hash of the first block containing the payment. Once Electrs has indexed both blocks, run the worker once with both webhook environment variables unset. Confirm the SQLite `payment_events` table contains an undelivered `invoice.settled` for this invoice.
+4. On the disposable node, call `invalidateblock` with the first block's hash. Generate three empty blocks by calling `generateblock MINER_ADDRESS '[]'` three times. Wait for Electrs to index the longer branch, then run the worker with webhook delivery enabled. The queued settlement event and subsequent settlement change should both be delivered. The WooCommerce order should still be pending.
+5. Mine two ordinary blocks with `generatetoaddress` so the payment returns to the chain. After Electrs catches up, run the worker with webhooks enabled. The resulting `invoice.restored` should complete the order. To test delivery retries, reset `delivered` and `next_attempt` to zero on the restored event in the disposable merchant database and run the worker again. The WooCommerce transaction ID and date paid should remain unchanged.
+
+For a direct callback count, a test-only WordPress plugin can register the following observer before placing the orders. Read the option using `wp option get paykit_test_completions_ORDERID`. The third order should have no counter after step 4 and a value of one after step 5 and each subsequent retry.
+
+```php
+add_action( 'woocommerce_payment_complete', static function ( $order_id ) {
+    $key = 'paykit_test_completions_' . $order_id;
+    update_option( $key, 1 + (int) get_option( $key, 0 ) );
+} );
+```

@@ -53,6 +53,8 @@ The invoice command prints its guest checkout path. The worker prepares and acti
 
 SQLite binds the invoice to its Reader, merchant identity, provider origin and a random request reference. Creation retries preserve the reference and terms. An exact replay recovers the original upstream invoice when a response was lost. A second Reader on the same order conflicts. If the provider explicitly reports that an unactivated preparation expired, the worker can prepare a new reference within the original local window.
 
+If another rail receives funds before delivery, the worker stops the queued proposal. For a prepared proposal, it asks the provider to void it. If activation had already succeeded before its response was lost, the worker continues observing both payment options.
+
 The worker signs the RFC 8785 canonical JSON body with the upstream domain, HTTP method and exact path. Requests send the random reference, amount, creator and Reader to the provider. The store's order ID and guest address stay local. Paykit Server's own Bitcoin observer verifies the invoice amount and confirmation depth.
 
 The original checkout deadline governs automatic fulfillment. The upstream payment window starts on activation, which can occur later. After downtime, the worker can prove timely payment when the upstream deadline was within the store's deadline, or when it previously recorded full, timely evidence for the same transaction. A later upstream deadline and a first observation after the local deadline require merchant review. Underpayments, overpayments, payments on multiple rails and reorgs remain visible through the shared ledger.
