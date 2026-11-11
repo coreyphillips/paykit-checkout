@@ -1,4 +1,4 @@
-//! Durable invoice and receiving-address allocation for one regtest merchant.
+//! Durable invoice and receiving-address allocation for one merchant account on one Bitcoin network.
 
 use std::{path::Path, time::Duration};
 
@@ -8,7 +8,9 @@ use bitcoin::{
     bip32::{ChildNumber, Xpub},
     secp256k1::Secp256k1,
 };
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior, params,
+};
 
 /// Payment instructions issued once for a merchant order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,15 +19,30 @@ pub struct Invoice {
     pub order_id: String,
     pub amount_sats: u64,
     pub address: String,
+    pub network: Network,
+    pub expires_at: i64,
 }
 
 impl Invoice {
     fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        let network_column = row.as_ref().column_index("network")?;
+        let network = row
+            .get::<_, String>(network_column)?
+            .parse()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    network_column,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
         Ok(Self {
             id: row.get("id")?,
             order_id: row.get("order_id")?,
             amount_sats: row.get("amount_sats")?,
             address: row.get("address")?,
+            network,
+            expires_at: row.get("expires_at")?,
         })
     }
 }
@@ -37,12 +54,17 @@ pub struct Store {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
-        let db = Connection::open(path).context("open invoice database")?;
+        let mut db = Connection::open(path).context("open invoice database")?;
         db.busy_timeout(Duration::from_secs(5))?;
-        db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS merchant (
+        let schema = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        schema.execute_batch(
+            "CREATE TABLE IF NOT EXISTS deployment (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1), network TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS merchant (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 account_xpub TEXT NOT NULL,
+                network TEXT NOT NULL,
                 next_index INTEGER NOT NULL DEFAULT 0 CHECK (next_index BETWEEN 0 AND 2147483648)
              );
              CREATE TABLE IF NOT EXISTS invoices (
@@ -50,9 +72,39 @@ impl Store {
                 order_id TEXT NOT NULL UNIQUE,
                 amount_sats INTEGER NOT NULL CHECK (amount_sats > 0),
                 address TEXT NOT NULL UNIQUE,
-                address_index INTEGER NOT NULL UNIQUE
+                address_index INTEGER NOT NULL UNIQUE,
+                network TEXT NOT NULL,
+                expires_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS chain_receipts (
+                invoice_id TEXT NOT NULL, txid TEXT NOT NULL, vout INTEGER NOT NULL,
+                first_seen_at INTEGER NOT NULL,
+                PRIMARY KEY (invoice_id, txid, vout)
              );",
         )?;
+        // Original stores were regtest-only. Retain their key, next index and checkout IDs.
+        let has_network: bool = schema.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('merchant') WHERE name = 'network')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_network {
+            schema.execute_batch(
+                "ALTER TABLE merchant ADD COLUMN network TEXT NOT NULL DEFAULT 'regtest';
+                 ALTER TABLE invoices ADD COLUMN network TEXT NOT NULL DEFAULT 'regtest';
+                 ALTER TABLE invoices ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0;
+                 UPDATE invoices SET expires_at = unixepoch() + 3600;",
+            )?;
+        }
+        schema.execute(
+            "INSERT OR IGNORE INTO deployment (singleton, network)
+             SELECT singleton, network FROM merchant",
+            [],
+        )?;
+        schema.commit()?;
+        crate::ledger::init(&db)?;
+        crate::lightning::init(&db)?;
+        crate::paykit::init(&db)?;
         Ok(Self { db })
     }
 
@@ -65,13 +117,44 @@ impl Store {
         Ok(Self { db })
     }
 
-    /// Retries of the same order return its original invoice. The wallet must
-    /// export a dedicated BIP84 test-family account at m/84'/1'/account'.
+    /// Commits the selected network even before the merchant issues an invoice.
+    pub fn pin_network(&self, network: Network) -> Result<()> {
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        pin_network_in(&tx, network)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn create(
         &mut self,
         order_id: &str,
         amount_sats: u64,
         account_xpub: &str,
+    ) -> Result<Invoice> {
+        self.create_on_network(order_id, amount_sats, account_xpub, Network::Regtest)
+    }
+
+    /// Retries return the original invoice. Supply a dedicated BIP84 account public key.
+    #[cfg(test)]
+    pub fn create_on_network(
+        &mut self,
+        order_id: &str,
+        amount_sats: u64,
+        account_xpub: &str,
+        network: Network,
+    ) -> Result<Invoice> {
+        self.create_with_reader(order_id, amount_sats, account_xpub, network, None)
+    }
+
+    /// Commits the receiving address and optional private request recipient together.
+    pub fn create_with_reader(
+        &mut self,
+        order_id: &str,
+        amount_sats: u64,
+        account_xpub: &str,
+        network: Network,
+        reader: Option<&crate::paykit::Reader>,
     ) -> Result<Invoice> {
         ensure!(
             (1..=128).contains(&order_id.len())
@@ -83,55 +166,77 @@ impl Store {
             (1..=Amount::MAX_MONEY.to_sat()).contains(&amount_sats),
             "invoice amount must be positive and at most 21 million BTC"
         );
-        let account = parse_account(account_xpub)?;
+        let account = parse_account(account_xpub, network)?;
 
         // Acquire the write lock before reading the idempotency key or allocating an index.
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        pin_network_in(&tx, network)?;
         tx.execute(
-            "INSERT INTO merchant (singleton, account_xpub) VALUES (1, ?1)
+            "INSERT INTO merchant (singleton, account_xpub, network) VALUES (1, ?1, ?2)
              ON CONFLICT (singleton) DO NOTHING",
-            [account_xpub],
+            params![account_xpub, network.to_string()],
         )?;
-        let (merchant_xpub, index): (String, u32) = tx.query_row(
-            "SELECT account_xpub, next_index FROM merchant WHERE singleton = 1",
+        let (merchant_xpub, merchant_network, index): (String, String, u32) = tx.query_row(
+            "SELECT account_xpub, network, next_index FROM merchant WHERE singleton = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         ensure!(
             merchant_xpub == account_xpub,
             "invoice database belongs to another account"
         );
+        ensure!(
+            merchant_network == network.to_string(),
+            "invoice database belongs to another Bitcoin network"
+        );
         let existing = tx
             .query_row(
-                "SELECT id, order_id, amount_sats, address FROM invoices WHERE order_id = ?1",
+                "SELECT * FROM invoices WHERE order_id = ?1",
                 [order_id],
                 Invoice::from_row,
             )
             .optional()?;
-        if let Some(invoice) = existing {
+        let invoice = if let Some(invoice) = existing {
             ensure!(
                 invoice.amount_sats == amount_sats,
                 "order already exists with a different amount"
             );
-            tx.commit()?;
-            return Ok(invoice);
-        }
-
-        let address = receiving_address(&account, index)?;
-        let invoice = tx.query_row(
-            "INSERT INTO invoices (order_id, amount_sats, address, address_index)
-             VALUES (?1, ?2, ?3, ?4) RETURNING id, order_id, amount_sats, address",
-            params![order_id, amount_sats, address.to_string(), index],
+            invoice
+        } else {
+            let address = receiving_address(&account, index, network)?;
+            let invoice = tx.query_row(
+            "INSERT INTO invoices (order_id, amount_sats, address, address_index, network, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, unixepoch() + 3600) RETURNING *",
+            params![order_id, amount_sats, address.to_string(), index, network.to_string()],
             Invoice::from_row,
         )?;
-        tx.execute(
-            "UPDATE merchant SET next_index = next_index + 1 WHERE singleton = 1",
-            [],
-        )?;
+            tx.execute(
+                "UPDATE merchant SET next_index = next_index + 1 WHERE singleton = 1",
+                [],
+            )?;
+            invoice
+        };
+        if let Some(reader) = reader {
+            crate::paykit::bind_in(&tx, &invoice, reader)?;
+        }
         tx.commit()?;
         Ok(invoice)
+    }
+
+    pub fn connection(&self) -> &Connection {
+        &self.db
+    }
+
+    /// Includes expired invoices because payments can arrive late or be reorganized.
+    pub fn all_invoices(&self) -> Result<Vec<Invoice>> {
+        let mut rows = self
+            .db
+            .prepare("SELECT * FROM invoices ORDER BY address_index")?;
+        Ok(rows
+            .query_map([], Invoice::from_row)?
+            .collect::<rusqlite::Result<_>>()?)
     }
 
     /// Looks up the invoice associated with an opaque checkout ID.
@@ -139,7 +244,7 @@ impl Store {
         Ok(self
             .db
             .query_row(
-                "SELECT id, order_id, amount_sats, address FROM invoices WHERE id = ?1",
+                "SELECT * FROM invoices WHERE id = ?1",
                 [id],
                 Invoice::from_row,
             )
@@ -147,13 +252,35 @@ impl Store {
     }
 }
 
-fn parse_account(input: &str) -> Result<Xpub> {
+fn pin_network_in(tx: &Transaction<'_>, network: Network) -> Result<()> {
+    let name = network.to_string();
+    tx.execute(
+        "INSERT INTO deployment (singleton,network) VALUES (1,?1) ON CONFLICT(singleton) DO NOTHING", [&name])?;
+    let matches: bool = tx.query_row(
+        "SELECT network=?1 AND NOT EXISTS(SELECT 1 FROM merchant WHERE network<>?1)
+         FROM deployment WHERE singleton=1",
+        [&name],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        matches,
+        "invoice database belongs to another Bitcoin network"
+    );
+    Ok(())
+}
+
+/// Derives a native SegWit address at the public account's external branch /0/index.
+pub fn derive_address(account_xpub: &str, network: Network, index: u32) -> Result<Address> {
+    receiving_address(&parse_account(account_xpub, network)?, index, network)
+}
+
+fn parse_account(input: &str, network: Network) -> Result<Xpub> {
     let account: Xpub = input
         .parse()
-        .map_err(|_| anyhow!("expected a test-family account tpub"))?;
+        .map_err(|_| anyhow!("expected a BIP32 account extended public key"))?;
     ensure!(
-        account.network == NetworkKind::Test,
-        "expected a test-family tpub"
+        account.network == NetworkKind::from(network),
+        "account public key has the wrong version for {network}"
     );
     // An xpub records its own depth and child number, but cannot prove its ancestors.
     ensure!(
@@ -163,7 +290,7 @@ fn parse_account(input: &str) -> Result<Xpub> {
     Ok(account)
 }
 
-fn receiving_address(account: &Xpub, index: u32) -> Result<Address> {
+fn receiving_address(account: &Xpub, index: u32, network: Network) -> Result<Address> {
     let path = [
         ChildNumber::from_normal_idx(0)?,
         ChildNumber::from_normal_idx(index).context("account receiving-address range exhausted")?,
@@ -171,7 +298,7 @@ fn receiving_address(account: &Xpub, index: u32) -> Result<Address> {
     let child = account.derive_pub(&Secp256k1::verification_only(), &path)?;
     Ok(Address::p2wpkh(
         &CompressedPublicKey(child.public_key),
-        Network::Regtest,
+        network,
     ))
 }
 
@@ -246,14 +373,15 @@ mod tests {
     #[test]
     fn rejects_private_mainnet_and_non_account_keys() {
         let private = key_at(Network::Regtest, "m/84'/1'/0'");
-        assert!(parse_account(&private.to_string()).is_err());
+        assert!(parse_account(&private.to_string(), Network::Regtest).is_err());
         for (network, path) in [
             (Network::Bitcoin, "m/84'/0'/0'"),
             (Network::Regtest, "m/84'/1'"),
             (Network::Regtest, "m/84'/1'/0"),
         ] {
-            let public = Xpub::from_priv(&Secp256k1::new(), &key_at(network, path));
-            assert!(parse_account(&public.to_string()).is_err());
+            let mut public = Xpub::from_priv(&Secp256k1::new(), &key_at(Network::Regtest, path));
+            public.network = NetworkKind::from(network);
+            assert!(parse_account(&public.to_string(), Network::Regtest).is_err());
         }
     }
 
@@ -270,6 +398,81 @@ mod tests {
         assert_eq!(
             store.create("coffee", 1, &account).unwrap().address,
             wallet_address(0)
+        );
+    }
+
+    #[test]
+    fn migrates_regtest_orders_without_changing_payment_details_or_reusing_addresses() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("merchant.sqlite");
+        let account = account_xpub(0);
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE merchant (singleton INTEGER PRIMARY KEY, account_xpub TEXT NOT NULL, next_index INTEGER DEFAULT 0);
+                 CREATE TABLE invoices (id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+                    order_id TEXT UNIQUE, amount_sats INTEGER, address TEXT UNIQUE, address_index INTEGER UNIQUE);"
+            ).unwrap();
+            db.execute("INSERT INTO merchant VALUES (1, ?1, 3)", [&account])
+                .unwrap();
+            db.execute(
+                "INSERT INTO invoices VALUES ('legacy', 'coffee', 99, ?1, 2)",
+                [wallet_address(2)],
+            )
+            .unwrap();
+        }
+        let mut store = Store::open(&path).unwrap();
+        let original = store.get("legacy").unwrap().unwrap();
+        assert_eq!(original.network, Network::Regtest);
+        assert!(original.expires_at > 0);
+        assert_eq!(original, store.create("coffee", 99, &account).unwrap());
+        assert_eq!(
+            wallet_address(3),
+            store.create("cake", 52, &account).unwrap().address
+        );
+        assert!(
+            store
+                .create_on_network("coffee", 99, &account, Network::Signet)
+                .is_err()
+        );
+        assert_eq!(store.all_invoices().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn empty_deployment_pin_survives_reopen_and_limits_invoice_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shop.db");
+        Store::open(&path)
+            .unwrap()
+            .pin_network(Network::Bitcoin)
+            .unwrap();
+        let mut reopened = Store::open(&path).unwrap();
+        assert!(reopened.pin_network(Network::Regtest).is_err());
+        assert!(reopened.create("coffee", 1, &account_xpub(0)).is_err());
+    }
+
+    #[test]
+    fn mainnet_wallet_receives_on_mainnet_and_rejects_test_keys() {
+        let mut public =
+            Xpub::from_priv(&Secp256k1::new(), &key_at(Network::Regtest, "m/84'/1'/0'"));
+        public.network = NetworkKind::Main;
+        let public = public.to_string();
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        assert!(
+            store
+                .create_on_network("order", 500, &account_xpub(0), Network::Bitcoin)
+                .is_err()
+        );
+        let invoice = store
+            .create_on_network("order", 500, &public, Network::Bitcoin)
+            .unwrap();
+        assert_eq!(invoice.network, Network::Bitcoin);
+        let expected = key_at(Network::Regtest, "m/84'/1'/0'/0/0")
+            .to_priv()
+            .public_key(&Secp256k1::new());
+        assert_eq!(
+            invoice.address,
+            Address::p2wpkh(&CompressedPublicKey(expected.inner), Network::Bitcoin).to_string()
         );
     }
 

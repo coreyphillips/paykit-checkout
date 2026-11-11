@@ -2,3 +2,5 @@
 *.sqlite3
 *.sqlite3-*
 .DS_Store
+*.worker.lock
+*-chain-sync.lock

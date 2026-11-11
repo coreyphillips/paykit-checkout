@@ -1,0 +1,90 @@
+--- a/paykit-server-e2e/examples/sdk-payment.rs
++++ b/paykit-server-e2e/examples/sdk-payment.rs
+@@ -20 +20 @@
+-use ed25519_dalek::{Signer, SigningKey};
++use ed25519_dalek::SigningKey;
+@@ -55 +55 @@
+-const BUNDLE: &str = "000G40R40M30E209185GR38E1W";
++const _BUNDLE: &str = "000G40R40M30E209185GR38E1W";
+@@ -151,22 +150,0 @@
+-}
+-
+-async fn signed_post(
+-    http: &PubkyHttpClient,
+-    base: &str,
+-    path: &str,
+-    key: &SigningKey,
+-    body: Value,
+-) -> Result<Vec<u8>> {
+-    let body = serde_json_canonicalizer::to_vec(&body)?;
+-    let signature = URL_SAFE_NO_PAD.encode(key.sign(&body).to_bytes());
+-    Ok(http
+-        .request(Method::POST, &format!("{base}{path}"))
+-        .header("Content-Type", "application/json")
+-        .header("X-Paykit-Signature", signature)
+-        .body(body)
+-        .send()
+-        .await?
+-        .error_for_status()?
+-        .bytes()
+-        .await?
+-        .to_vec())
+@@ -259 +237,3 @@
+-                            terms.metadata.get("bundle_id") == Some(&json!(BUNDLE))
++                            std::env::var_os("CHECKOUT_REGTEST_REFERENCE_FILE")
++                                .and_then(|p| std::fs::read_to_string(p).ok())
++                                .is_some_and(|r| terms.payment_reference == r)
+@@ -284 +264 @@
+-    lock_resource: &str,
++    _lock_resource: &str,
+@@ -290,11 +270,13 @@
+-    signed_post(
+-        http,
+-        base,
+-        "/invoices",
+-        locks_key,
+-        json!({"bundle_id":BUNDLE, "lock_resource":lock_resource, "reader":reader.to_app_key()}),
+-    )
+-    .await?;
+-    println!(
+-        "Invoice created; waiting for the SDK to complete the link and receive the request..."
+-    );
++    use std::{fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt, process::Command};
++    let key_file = std::env::var("CHECKOUT_REGTEST_SIGNING_FILE")?;
++    OpenOptions::new().write(true).create_new(true).mode(0o600).open(&key_file)?
++        .write_all(URL_SAFE_NO_PAD.encode(locks_key.to_bytes()).as_bytes())?;
++    let mut child = Command::new(std::env::var("CHECKOUT_REGTEST_TEST_BINARY")?)
++        .args(["--exact", "paykit::tests::real_sdk_reader_pays_checkout", "--ignored", "--nocapture"])
++        .env("CHECKOUT_PAYKIT_URL", base)
++        .env("CHECKOUT_PAYKIT_NETWORK", "regtest")
++        .env("CHECKOUT_PAYKIT_CREATOR", creator.to_app_key())
++        .env("CHECKOUT_PAYKIT_SIGNING_KEY_FILE", &key_file)
++        .env("CHECKOUT_REGTEST_READER", reader.to_app_key())
++        .spawn()?;
++    println!("Checkout started; awaiting a privately delivered Marketplace request.");
+@@ -370,19 +352,3 @@
+-        let status: Value = serde_json::from_slice(
+-            &signed_post(
+-                http,
+-                base,
+-                "/transactions/status",
+-                locks_key,
+-                json!({"bundle_id":BUNDLE, "creator":creator.to_app_key()}),
+-            )
+-            .await?,
+-        )?;
+-        if status["status"] == "confirmed"
+-            && status["amount_matched"] == true
+-            && status["confirmations"]
+-                .as_u64()
+-                .is_some_and(|count| count >= 6)
+-        {
+-            println!(
+-                "PASS: Paykit Server independently observed the invoice payment with six confirmations."
+-            );
++        if let Some(exit) = child.try_wait()? {
++            ensure!(exit.success(), "merchant checkout test failed: {exit}");
++            println!("PASS: checkout recorded six confirmations and one fulfillment event.");
+@@ -391 +357 @@
+-        tokio::time::sleep(Duration::from_secs(1)).await;
++        tokio::time::sleep(Duration::from_millis(250)).await;

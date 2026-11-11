@@ -15,3 +15,11 @@ jobs:
       - run: cargo +stable fmt --check
       - run: cargo +stable clippy --locked --all-targets -- -D warnings
       - run: cargo +stable test --locked
+      - name: Check WooCommerce PHP and JavaScript
+        run: |
+          for file in integrations/woocommerce/paykit-checkout/*.php; do
+            php -l "$file"
+          done
+          node --check integrations/woocommerce/paykit-checkout/blocks.js
+      - name: Verify Bitcoin settlement and reorg recovery on regtest
+        run: python3 tests/regtest-chain/run.py

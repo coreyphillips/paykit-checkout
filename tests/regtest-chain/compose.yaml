@@ -1,0 +1,22 @@
+services:
+  bitcoin:
+    image: polarlightning/bitcoind:27.0
+    command: ["bitcoind", "-regtest", "-server", "-txindex", "-rpcbind=0.0.0.0", "-rpcallowip=0.0.0.0/0", "-rpcport=18443", "-rpcuser=checkout", "-rpcpassword=regtest-fixture", "-fallbackfee=0.0002"]
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-regtest", "-rpcport=18443", "-rpcuser=checkout", "-rpcpassword=regtest-fixture", "getblockcount"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+  electrs:
+    image: getumbrel/electrs:v0.11.0
+    depends_on:
+      bitcoin:
+        condition: service_healthy
+    restart: on-failure
+    configs: [electrum-cookie]
+    command: ["--network=regtest", "--daemon-rpc-addr=bitcoin:18443", "--daemon-p2p-addr=bitcoin:18444", "--cookie-file=/electrum-cookie", "--electrum-rpc-addr=0.0.0.0:60001", "--wait-duration-secs=1", "--skip-block-download-wait"]
+    ports: ["127.0.0.1::60001"]
+
+configs:
+  electrum-cookie:
+    content: "checkout:regtest-fixture"
